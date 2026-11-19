@@ -169,7 +169,7 @@ class MainActivity : Activity() {
                     if (sourceOrigin.scheme != "https") return
                     if (sourceOrigin.host != "grok.com") return
 
-                    recordDetection(message.data)
+                    message.data?.let { recordDetection(it) }
                 }
             }
         )
