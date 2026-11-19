@@ -34,6 +34,11 @@ class MainActivity : Activity() {
     private val journalFile: File
         get() = File(File(filesDir, "network-detection"), "events.jsonl")
 
+    private val payloadFile: File
+        get() = File(File(filesDir, "network-detection"), "conversation_payloads.jsonl")
+
+    private val payloadExportRequestCode = 4103
+
     private val detectionScript = """
         (() => {
           if (window.__grokInspectorDetectionInstalled) return;
@@ -56,6 +61,28 @@ class MainActivity : Activity() {
                 contentType: String(contentType || "").slice(0, 100),
                 method: String(method || "GET").slice(0, 10),
                 contentLength: String(contentLength || "").slice(0, 20)
+              }));
+            } catch (_) {}
+          }
+
+          function reportPayload(url, status, contentType, method, body) {
+            try {
+              const u = new URL(url, location.href);
+              if (u.origin !== "https://grok.com") return;
+              if (!endpoint.test(u.pathname)) return;
+              if (Number(status) !== 200) return;
+              if (String(method || "GET").toUpperCase() !== "GET") return;
+              if (!String(contentType || "").toLowerCase().includes("application/json")) return;
+              if (typeof body !== "string" || body.length === 0 || body.length > 1000000) return;
+
+              JSON.parse(body);
+
+              if (!window.GrokInspector) return;
+              window.GrokInspector.postMessage(JSON.stringify({
+                type: "conversation_payload",
+                path: u.pathname,
+                status: 200,
+                body: body
               }));
             } catch (_) {}
           }
@@ -83,6 +110,22 @@ class MainActivity : Activity() {
                 );
               } catch (_) {}
 
+              try {
+                const contentType = response.headers.get("content-type") || "";
+                if (response.status === 200 &&
+                    contentType.toLowerCase().includes("application/json")) {
+                  response.clone().text().then(body => {
+                    reportPayload(
+                      response.url || url,
+                      response.status,
+                      contentType,
+                      method,
+                      body
+                    );
+                  }).catch(() => {});
+                }
+              } catch (_) {}
+
               return response;
             });
           };
@@ -107,6 +150,19 @@ class MainActivity : Activity() {
                   this.__grokInspectorMethod,
                   this.getResponseHeader("content-length")
                 );
+
+                const contentType = this.getResponseHeader("content-type") || "";
+                if (this.status === 200 &&
+                    contentType.toLowerCase().includes("application/json") &&
+                    (!this.responseType || this.responseType === "text")) {
+                  reportPayload(
+                    this.responseURL || this.__grokInspectorUrl,
+                    this.status,
+                    contentType,
+                    this.__grokInspectorMethod,
+                    this.responseText
+                  );
+                }
               } catch (_) {}
             });
 
@@ -164,6 +220,11 @@ class MainActivity : Activity() {
             setOnClickListener { exportJournal() }
         }
 
+        val payloadExportButton = Button(this).apply {
+            text = "Exporter JSON"
+            setOnClickListener { exportPayloads() }
+        }
+
         controls.addView(
             diagnosticButton,
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
@@ -171,6 +232,11 @@ class MainActivity : Activity() {
 
         controls.addView(
             exportButton,
+            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        )
+
+        controls.addView(
+            payloadExportButton,
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
         )
 
@@ -229,7 +295,13 @@ class MainActivity : Activity() {
                     if (sourceOrigin.scheme != "https") return
                     if (sourceOrigin.host != "grok.com") return
 
-                    message.data?.let { recordDetection(it) }
+                    message.data?.let {
+                        if (it.contains("\"type\":\"conversation_payload\"")) {
+                            recordPayload(it)
+                        } else {
+                            recordDetection(it)
+                        }
+                    }
                 }
             }
         )
@@ -287,6 +359,50 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun recordPayload(data: String) {
+        try {
+            if (data.toByteArray(Charsets.UTF_8).size > 1_100_000) return
+
+            val received = JSONObject(data)
+            if (received.optString("type") != "conversation_payload") return
+
+            val path = received.optString("path")
+            if (!Regex(
+                "^/rest/app-chat/conversations_v2/[A-Za-z0-9_-]+$"
+            ).matches(path)) return
+
+            if (received.optInt("status") != 200) return
+
+            val body = received.optString("body")
+            if (body.isBlank() || body.toByteArray(Charsets.UTF_8).size > 1_000_000) return
+
+            val parsedBody = org.json.JSONTokener(body).nextValue()
+
+            val event = JSONObject()
+                .put("captured_at_epoch_ms", System.currentTimeMillis())
+                .put("path", "/rest/app-chat/conversations_v2/[ID]")
+                .put("status", 200)
+                .put("body", parsedBody)
+
+            val directory = payloadFile.parentFile
+            if (directory != null && !directory.exists()) {
+                directory.mkdirs()
+            }
+
+            payloadFile.appendText(event.toString() + "\n")
+
+            runOnUiThread {
+                Toast.makeText(
+                    this,
+                    "Contenu JSON de conversation capturé",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        } catch (_: Exception) {
+            // Une réponse invalide ne doit pas interrompre le navigateur.
+        }
+    }
+
     private fun showDiagnostic() {
         val events = if (journalFile.exists()) {
             journalFile.readLines().filter { it.isNotBlank() }
@@ -300,6 +416,11 @@ class MainActivity : Activity() {
 
         val successCount = parsed.count { it.optInt("status") == 200 }
         val errorCount = parsed.count { it.optInt("status") >= 400 }
+        val payloadCount = if (payloadFile.exists()) {
+            payloadFile.readLines().count { it.isNotBlank() }
+        } else {
+            0
+        }
 
         val formatter = SimpleDateFormat(
             "dd/MM/yyyy HH:mm:ss",
@@ -321,6 +442,7 @@ class MainActivity : Activity() {
             appendLine("Événements enregistrés : ${parsed.size}")
             appendLine("Réponses HTTP 200 : $successCount")
             appendLine("Réponses HTTP >= 400 : $errorCount")
+            appendLine("Corps JSON capturés : $payloadCount")
             appendLine("Fichier présent : ${journalFile.exists()}")
             appendLine()
             appendLine("10 DERNIERS ÉVÉNEMENTS")
@@ -335,7 +457,7 @@ class MainActivity : Activity() {
                 }
             }
 
-            appendLine("Les corps JSON des conversations ne sont pas enregistrés.")
+            appendLine("Les corps JSON sont conservés séparément dans le stockage privé de l'application.")
         }
 
         val textView = TextView(this).apply {
@@ -374,6 +496,25 @@ class MainActivity : Activity() {
         startActivityForResult(intent, exportRequestCode)
     }
 
+    private fun exportPayloads() {
+        if (!payloadFile.exists() || payloadFile.length() == 0L) {
+            Toast.makeText(
+                this,
+                "Aucun contenu JSON capturé pour le moment",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/x-ndjson"
+            putExtra(Intent.EXTRA_TITLE, "conversation_payloads.jsonl")
+        }
+
+        startActivityForResult(intent, payloadExportRequestCode)
+    }
+
     @Deprecated("Deprecated in Android API")
     override fun onActivityResult(
         requestCode: Int,
@@ -382,25 +523,34 @@ class MainActivity : Activity() {
     ) {
         super.onActivityResult(requestCode, resultCode, data)
 
-        if (requestCode != exportRequestCode || resultCode != RESULT_OK) {
-            return
-        }
+        if (resultCode != RESULT_OK) return
+        if (requestCode != exportRequestCode &&
+            requestCode != payloadExportRequestCode) return
 
         val uri = data?.data ?: return
+        val sourceFile = if (requestCode == payloadExportRequestCode) {
+            payloadFile
+        } else {
+            journalFile
+        }
 
         try {
             val output = contentResolver.openOutputStream(uri)
                 ?: throw IllegalStateException("Ouverture du fichier impossible")
 
             output.use { destination ->
-                journalFile.inputStream().use { source ->
+                sourceFile.inputStream().use { source ->
                     source.copyTo(destination)
                 }
             }
 
             Toast.makeText(
                 this,
-                "Journal exporté avec succès",
+                if (requestCode == payloadExportRequestCode) {
+                    "Contenus JSON exportés avec succès"
+                } else {
+                    "Journal exporté avec succès"
+                },
                 Toast.LENGTH_LONG
             ).show()
 
