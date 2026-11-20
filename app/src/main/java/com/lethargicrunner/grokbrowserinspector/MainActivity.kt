@@ -23,11 +23,14 @@ import java.io.File
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.security.MessageDigest
 
 class MainActivity : Activity() {
 
     private lateinit var webView: WebView
     private var documentStartCapture = false
+    private var captureEnabled = false
+    private var pendingSampleFile: File? = null
 
     private val exportRequestCode = 4102
 
@@ -38,6 +41,7 @@ class MainActivity : Activity() {
         get() = File(File(filesDir, "network-detection"), "conversation_payloads.jsonl")
 
     private val payloadExportRequestCode = 4103
+    private val sampleExportRequestCode = 4104
 
     private val detectionScript = """
         (() => {
@@ -257,6 +261,32 @@ class MainActivity : Activity() {
             )
         )
 
+        val campaignControls = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+        }
+
+        val captureButton = Button(this).apply {
+            text = "Démarrer capture"
+            setOnClickListener {
+                captureEnabled = !captureEnabled
+                text = if (captureEnabled) "Arrêter capture" else "Démarrer capture"
+                Toast.makeText(
+                    this@MainActivity,
+                    if (captureEnabled) "Capture des conversations activée" else "Capture des conversations arrêtée",
+                    Toast.LENGTH_SHORT
+                ).show()
+            }
+        }
+
+        val sampleButton = Button(this).apply {
+            text = "Exporter échantillon (5)"
+            setOnClickListener { exportSample() }
+        }
+
+        campaignControls.addView(captureButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        campaignControls.addView(sampleButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(campaignControls, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+
         root.addView(
             webView,
             LinearLayout.LayoutParams(
@@ -373,6 +403,7 @@ class MainActivity : Activity() {
     }
 
     private fun recordPayload(data: String) {
+        if (!captureEnabled) return
         try {
             if (data.toByteArray(Charsets.UTF_8).size > 1_100_000) return
 
@@ -403,6 +434,14 @@ class MainActivity : Activity() {
 
             val parsedBody = org.json.JSONTokener(body).nextValue()
 
+            val conversationId = if (isV2) {
+                path.substringAfterLast("/")
+            } else {
+                path.removePrefix("/rest/app-chat/conversations/").substringBefore("/")
+            }
+            val digest = MessageDigest.getInstance("SHA-256").digest(conversationId.toByteArray(Charsets.UTF_8))
+            val conversationKey = digest.joinToString("") { "%02x".format(it) }
+
             val safePath = path.replace(
                 Regex("(/conversations(?:_v2)?/)[A-Za-z0-9_-]+")
             ) { match ->
@@ -411,6 +450,7 @@ class MainActivity : Activity() {
 
             val event = JSONObject()
                 .put("captured_at_epoch_ms", System.currentTimeMillis())
+                .put("conversation_key", conversationKey)
                 .put("path", safePath)
                 .put("method", method)
                 .put("status", 200)
@@ -433,6 +473,43 @@ class MainActivity : Activity() {
         } catch (_: Exception) {
             // Une réponse invalide ne doit pas interrompre le navigateur.
         }
+    }
+
+    private fun exportSample() {
+        if (!payloadFile.exists() || payloadFile.length() == 0L) {
+            Toast.makeText(this, "Aucune conversation capturée", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val rows = payloadFile.readLines().mapNotNull { line ->
+            runCatching {
+                val json = JSONObject(line)
+                val key = json.optString("conversation_key")
+                if (key.isBlank()) null else Pair(line, key)
+            }.getOrNull()
+        }
+        val selectedKeys = rows.map { it.second }.distinct().take(5).toSet()
+        if (selectedKeys.isEmpty()) {
+            Toast.makeText(this, "Aucune capture compatible. Démarre une capture puis ouvre des conversations.", Toast.LENGTH_LONG).show()
+            return
+        }
+        val output = StringBuilder()
+        var writtenBytes = 0L
+        for (line in rows.filter { it.second in selectedKeys }.map { it.first }) {
+            val size = line.toByteArray(Charsets.UTF_8).size.toLong() + 1L
+            if (writtenBytes + size > 20L * 1024L * 1024L) break
+            output.append(line).append('\n')
+            writtenBytes += size
+        }
+        val sampleFile = File(cacheDir, "grok_sample_5.jsonl")
+        sampleFile.writeText(output.toString(), Charsets.UTF_8)
+        pendingSampleFile = sampleFile
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/x-ndjson"
+            putExtra(Intent.EXTRA_TITLE, "grok_sample_5.jsonl")
+        }
+        Toast.makeText(this, "Échantillon prêt : ${selectedKeys.size} conversations, limite 20 Mo", Toast.LENGTH_LONG).show()
+        startActivityForResult(intent, sampleExportRequestCode)
     }
 
     private fun showDiagnostic() {
@@ -555,15 +632,30 @@ class MainActivity : Activity() {
     ) {
         super.onActivityResult(requestCode, resultCode, data)
 
-        if (resultCode != RESULT_OK) return
         if (requestCode != exportRequestCode &&
-            requestCode != payloadExportRequestCode) return
+            requestCode != payloadExportRequestCode &&
+            requestCode != sampleExportRequestCode) return
 
-        val uri = data?.data ?: return
-        val sourceFile = if (requestCode == payloadExportRequestCode) {
-            payloadFile
-        } else {
-            journalFile
+        if (resultCode != RESULT_OK) {
+            if (requestCode == sampleExportRequestCode) {
+                pendingSampleFile?.delete()
+                pendingSampleFile = null
+            }
+            return
+        }
+
+        val uri = data?.data
+        if (uri == null) {
+            if (requestCode == sampleExportRequestCode) {
+                pendingSampleFile?.delete()
+                pendingSampleFile = null
+            }
+            return
+        }
+        val sourceFile = when (requestCode) {
+            payloadExportRequestCode -> payloadFile
+            sampleExportRequestCode -> pendingSampleFile ?: throw IllegalStateException("Échantillon temporaire introuvable")
+            else -> journalFile
         }
 
         try {
@@ -578,10 +670,10 @@ class MainActivity : Activity() {
 
             Toast.makeText(
                 this,
-                if (requestCode == payloadExportRequestCode) {
-                    "Contenus JSON exportés avec succès"
-                } else {
-                    "Journal exporté avec succès"
+                when (requestCode) {
+                    payloadExportRequestCode -> "Contenus JSON exportés avec succès"
+                    sampleExportRequestCode -> "Échantillon exporté avec succès"
+                    else -> "Journal exporté avec succès"
                 },
                 Toast.LENGTH_LONG
             ).show()
@@ -592,6 +684,11 @@ class MainActivity : Activity() {
                 "Erreur export : ${error.message}",
                 Toast.LENGTH_LONG
             ).show()
+        } finally {
+            if (requestCode == sampleExportRequestCode) {
+                pendingSampleFile?.delete()
+                pendingSampleFile = null
+            }
         }
     }
 
