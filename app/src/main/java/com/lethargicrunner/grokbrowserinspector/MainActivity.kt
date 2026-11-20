@@ -69,9 +69,17 @@ class MainActivity : Activity() {
             try {
               const u = new URL(url, location.href);
               if (u.origin !== "https://grok.com") return;
-              if (!endpoint.test(u.pathname)) return;
+
+              const m = String(method || "GET").toUpperCase();
+              const isV2 = /^\/rest\/app-chat\/conversations_v2\/[A-Za-z0-9_-]+$/.test(u.pathname);
+              const isNode = /^\/rest\/app-chat\/conversations\/[A-Za-z0-9_-]+\/response-node$/.test(u.pathname);
+              const isLoad = /^\/rest\/app-chat\/conversations\/[A-Za-z0-9_-]+\/load-responses$/.test(u.pathname);
+
+              if (!(isV2 && m === "GET") &&
+                  !(isNode && m === "GET") &&
+                  !(isLoad && m === "POST")) return;
+
               if (Number(status) !== 200) return;
-              if (String(method || "GET").toUpperCase() !== "GET") return;
               if (!String(contentType || "").toLowerCase().includes("application/json")) return;
               if (typeof body !== "string" || body.length === 0 || body.length > 1000000) return;
 
@@ -81,6 +89,7 @@ class MainActivity : Activity() {
               window.GrokInspector.postMessage(JSON.stringify({
                 type: "conversation_payload",
                 path: u.pathname,
+                method: m,
                 status: 200,
                 body: body
               }));
@@ -371,9 +380,21 @@ class MainActivity : Activity() {
             if (received.optString("type") != "conversation_payload") return
 
             val path = received.optString("path")
-            if (!Regex(
+            val method = received.optString("method").uppercase()
+
+            val isV2 = Regex(
                 "^/rest/app-chat/conversations_v2/[A-Za-z0-9_-]+$"
-            ).matches(path)) return
+            ).matches(path)
+            val isNode = Regex(
+                "^/rest/app-chat/conversations/[A-Za-z0-9_-]+/response-node$"
+            ).matches(path)
+            val isLoad = Regex(
+                "^/rest/app-chat/conversations/[A-Za-z0-9_-]+/load-responses$"
+            ).matches(path)
+
+            if (!(isV2 && method == "GET") &&
+                !(isNode && method == "GET") &&
+                !(isLoad && method == "POST")) return
 
             if (received.optInt("status") != 200) return
 
@@ -382,9 +403,16 @@ class MainActivity : Activity() {
 
             val parsedBody = org.json.JSONTokener(body).nextValue()
 
+            val safePath = path.replace(
+                Regex("(/conversations(?:_v2)?/)[A-Za-z0-9_-]+")
+            ) { match ->
+                match.groupValues[1] + "[ID]"
+            }
+
             val event = JSONObject()
                 .put("captured_at_epoch_ms", System.currentTimeMillis())
-                .put("path", "/rest/app-chat/conversations_v2/[ID]")
+                .put("path", safePath)
+                .put("method", method)
                 .put("status", 200)
                 .put("body", parsedBody)
 
