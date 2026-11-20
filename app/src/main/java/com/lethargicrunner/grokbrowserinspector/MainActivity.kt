@@ -52,7 +52,7 @@ class MainActivity : Activity() {
               const u = new URL(url, location.href);
 
               if (u.origin !== "https://grok.com") return;
-              if (!endpoint.test(u.pathname)) return;
+              if (!/^\/rest\/app-chat\/[A-Za-z0-9_./-]+$/.test(u.pathname)) return;
               if (!window.GrokInspector) return;
 
               window.GrokInspector.postMessage(JSON.stringify({
@@ -325,7 +325,7 @@ class MainActivity : Activity() {
             val path = received.optString("path")
 
             if (!Regex(
-                "^/rest/app-chat/conversations_v2/[A-Za-z0-9_-]+$"
+                "^/rest/app-chat/[A-Za-z0-9_./-]+$"
             ).matches(path)) return
 
             val status = received.optInt("status")
@@ -333,7 +333,11 @@ class MainActivity : Activity() {
             // L'identifiant réel de conversation n'est pas conservé.
             val event = JSONObject()
                 .put("detected_at_epoch_ms", System.currentTimeMillis())
-                .put("path", "/rest/app-chat/conversations_v2/[ID]")
+                .put("path", path
+                    .replace(Regex("(/conversations(?:_v2)?/)[A-Za-z0-9_-]+")) { match ->
+                        match.groupValues[1] + "[ID]"
+                    }
+                    .replace(Regex("(?i)[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"), "[ID]"))
                 .put("status", status)
                 .put("method", received.optString("method"))
                 .put("content_type", received.optString("contentType"))
