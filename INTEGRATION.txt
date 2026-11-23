@@ -1,0 +1,15 @@
+GROK BROWSER INSPECTOR — Android launcher icon resources
+
+This archive contains only Android res/ assets.
+Copy/merge app/src/main/res/ into the repository's existing
+app/src/main/res/ directory. Do not delete existing resources.
+
+Then inspect app/src/main/AndroidManifest.xml and ensure the
+<application> element contains:
+    android:icon="@mipmap/ic_launcher"
+    android:roundIcon="@mipmap/ic_launcher_round"
+
+Keep all other manifest attributes unchanged.
+
+Adaptive icon resources are supplied for API 26+.
+Legacy raster launcher icons are supplied for older Android versions.

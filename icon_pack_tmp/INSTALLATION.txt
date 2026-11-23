@@ -1,0 +1,9 @@
+Pack d'icônes Grok Browser Inspector
+
+Copier le contenu du dossier app/src/main/res/ dans le même dossier du projet.
+Les PNG mipmap remplacent les icônes classiques et drawable-nodpi remplace
+le premier plan adaptatif. Ne pas remplacer les fichiers XML adaptatifs ni
+ic_launcher_background.xml : ils restent compatibles avec ce pack.
+
+Faire une sauvegarde des fichiers existants avant remplacement.
+Puis reconstruire et réinstaller l'APK pour voir le nouvel icône.
