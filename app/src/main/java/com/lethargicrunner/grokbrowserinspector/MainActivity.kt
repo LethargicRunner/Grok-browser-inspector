@@ -7,6 +7,7 @@ import android.net.Uri
 import android.os.Bundle
 import android.view.ViewGroup
 import android.webkit.WebChromeClient
+import android.webkit.ValueCallback
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
@@ -31,6 +32,11 @@ class MainActivity : Activity() {
     private var documentStartCapture = false
     private var captureEnabled = false
     private var pendingSampleFile: File? = null
+    private var pendingFileChooserCallback:
+        ValueCallback<Array<Uri>>? = null
+
+    private val fileChooserRequestCode = 4105
+
 
     private val exportRequestCode = 4102
 
@@ -213,7 +219,43 @@ class MainActivity : Activity() {
             }
         }
 
-        webView.webChromeClient = WebChromeClient()
+        webView.webChromeClient = object : WebChromeClient() {
+            override fun onShowFileChooser(
+                webView: WebView?,
+                filePathCallback: ValueCallback<Array<Uri>>?,
+                fileChooserParams: WebChromeClient.FileChooserParams?
+            ): Boolean {
+                if (filePathCallback == null) return false
+
+                pendingFileChooserCallback?.onReceiveValue(null)
+                pendingFileChooserCallback = filePathCallback
+
+                try {
+                    val intent = fileChooserParams?.createIntent()
+                        ?: Intent(Intent.ACTION_GET_CONTENT).apply {
+                            addCategory(Intent.CATEGORY_OPENABLE)
+                            type = "*/*"
+                        }
+
+                    startActivityForResult(
+                        intent,
+                        fileChooserRequestCode
+                    )
+                    return true
+                } catch (e: Exception) {
+                    pendingFileChooserCallback = null
+                    filePathCallback.onReceiveValue(null)
+
+                    Toast.makeText(
+                        this@MainActivity,
+                        "Sélecteur de fichiers indisponible",
+                        Toast.LENGTH_LONG
+                    ).show()
+
+                    return false
+                }
+            }
+        }
 
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
@@ -631,6 +673,24 @@ class MainActivity : Activity() {
         data: Intent?
     ) {
         super.onActivityResult(requestCode, resultCode, data)
+
+        if (requestCode == fileChooserRequestCode) {
+            val callback = pendingFileChooserCallback
+            pendingFileChooserCallback = null
+
+            val result = if (resultCode == RESULT_OK) {
+                WebChromeClient.FileChooserParams.parseResult(
+                    resultCode,
+                    data
+                )
+            } else {
+                null
+            }
+
+            callback?.onReceiveValue(result)
+            return
+        }
+
 
         if (requestCode != exportRequestCode &&
             requestCode != payloadExportRequestCode &&
