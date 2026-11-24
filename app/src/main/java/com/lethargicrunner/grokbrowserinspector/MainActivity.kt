@@ -6,6 +6,10 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.view.ViewGroup
+import android.view.Gravity
+import android.graphics.Color
+import android.graphics.drawable.GradientDrawable
+import android.widget.FrameLayout
 import android.webkit.WebChromeClient
 import android.webkit.ValueCallback
 import android.webkit.WebSettings
@@ -47,6 +51,12 @@ class MainActivity : Activity() {
         get() = File(File(filesDir, "network-detection"), "conversation_payloads.jsonl")
 
     private val payloadExportRequestCode = 4103
+    private val imageExportRequestCode = 4106
+
+    private val imageResourcesFile: File
+        get() = File(File(filesDir, "network-detection"), "image_resources.jsonl")
+
+    private val recordedImageKeys = HashSet<String>()
     private val sampleExportRequestCode = 4104
 
     private val detectionScript = """
@@ -187,6 +197,86 @@ class MainActivity : Activity() {
 
             return originalSend.apply(this, args);
           };
+
+          const seenImageUrls = new Set();
+
+          function reportImageResource(rawUrl, initiatorType) {
+            try {
+              const u = new URL(rawUrl, location.href);
+              if (u.protocol !== "https:") return;
+              if (u.origin === location.origin &&
+                  u.pathname.startsWith("/rest/")) return;
+
+              const url = u.href;
+              if (url.length > 4096 || seenImageUrls.has(url)) return;
+              seenImageUrls.add(url);
+
+              if (!window.GrokInspector) return;
+              window.GrokInspector.postMessage(JSON.stringify({
+                type: "image_resource",
+                url: url,
+                initiatorType: String(initiatorType || "unknown").slice(0, 40)
+              }));
+            } catch (_) {}
+          }
+
+          function inspectResource(entry) {
+            try {
+              const url = String(entry.name || "");
+              const looksLikeImage =
+                entry.initiatorType === "img" ||
+                entry.initiatorType === "image" ||
+                /\.(avif|bmp|gif|jpe?g|png|webp|svg)(?:$|[?#])/i.test(url);
+
+              if (looksLikeImage) {
+                reportImageResource(url, entry.initiatorType);
+              }
+            } catch (_) {}
+          }
+
+          try {
+            performance.getEntriesByType("resource").forEach(inspectResource);
+
+            const imageObserver = new PerformanceObserver(list => {
+              list.getEntries().forEach(inspectResource);
+            });
+            imageObserver.observe({ type: "resource", buffered: true });
+          } catch (_) {}
+
+          function inspectImageElement(img) {
+            try {
+              if (img && img.currentSrc) {
+                reportImageResource(img.currentSrc, "img-element");
+              } else if (img && img.src) {
+                reportImageResource(img.src, "img-element");
+              }
+            } catch (_) {}
+          }
+
+          try {
+            document.querySelectorAll("img").forEach(inspectImageElement);
+            const imageMutationObserver = new MutationObserver(records => {
+              records.forEach(record => {
+                if (record.type === "attributes") {
+                  inspectImageElement(record.target);
+                }
+                record.addedNodes.forEach(node => {
+                  if (node.nodeType !== 1) return;
+                  if (node.tagName === "IMG") inspectImageElement(node);
+                  if (node.querySelectorAll) {
+                    node.querySelectorAll("img").forEach(inspectImageElement);
+                  }
+                });
+              });
+            });
+            imageMutationObserver.observe(document.documentElement, {
+              childList: true,
+              subtree: true,
+              attributes: true,
+              attributeFilter: ["src", "srcset"]
+            });
+          } catch (_) {}
+
         })();
     """.trimIndent()
 
@@ -205,6 +295,7 @@ class MainActivity : Activity() {
             setSupportMultipleWindows(false)
         }
 
+        loadRecordedImageKeys()
         setupDetection()
 
         webView.webViewClient = object : WebViewClient() {
@@ -257,85 +348,104 @@ class MainActivity : Activity() {
             }
         }
 
-        val root = LinearLayout(this).apply {
-            orientation = LinearLayout.VERTICAL
-        }
-
-        val controls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-
-        val diagnosticButton = Button(this).apply {
-            text = "Diagnostic"
-            setOnClickListener { showDiagnostic() }
-        }
-
-        val exportButton = Button(this).apply {
-            text = "Exporter le journal"
-            setOnClickListener { exportJournal() }
-        }
-
-        val payloadExportButton = Button(this).apply {
-            text = "Exporter JSON"
-            setOnClickListener { exportPayloads() }
-        }
-
-        controls.addView(
-            diagnosticButton,
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        )
-
-        controls.addView(
-            exportButton,
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        )
-
-        controls.addView(
-            payloadExportButton,
-            LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
-        )
-
-        root.addView(
-            controls,
-            LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT,
-                ViewGroup.LayoutParams.WRAP_CONTENT
-            )
-        )
-
-        val campaignControls = LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-        }
-
-        val captureButton = Button(this).apply {
-            text = "Démarrer capture"
-            setOnClickListener {
-                captureEnabled = !captureEnabled
-                text = if (captureEnabled) "Arrêter capture" else "Démarrer capture"
-                Toast.makeText(
-                    this@MainActivity,
-                    if (captureEnabled) "Capture des conversations activée" else "Capture des conversations arrêtée",
-                    Toast.LENGTH_SHORT
-                ).show()
-            }
-        }
-
-        val sampleButton = Button(this).apply {
-            text = "Exporter échantillon (5)"
-            setOnClickListener { exportSample() }
-        }
-
-        campaignControls.addView(captureButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        campaignControls.addView(sampleButton, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
-        root.addView(campaignControls, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        val root = FrameLayout(this)
 
         root.addView(
             webView,
-            LinearLayout.LayoutParams(
+            FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT,
-                0,
-                1f
+                ViewGroup.LayoutParams.MATCH_PARENT
             )
+        )
+
+        val menuPanel = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+            background = GradientDrawable().apply {
+                setColor(Color.WHITE)
+                cornerRadius = dp(18).toFloat()
+            }
+            elevation = dp(12).toFloat()
+            visibility = ViewGroup.GONE
+        }
+
+        fun menuItem(label: String, action: () -> Unit): Button {
+            return Button(this).apply {
+                text = label
+                setTextColor(Color.rgb(35, 35, 35))
+                setOnClickListener {
+                    menuPanel.visibility = ViewGroup.GONE
+                    action()
+                }
+            }
+        }
+
+        menuPanel.addView(menuItem("Diagnostic") { showDiagnostic() })
+        menuPanel.addView(menuItem("Exporter le journal") { exportJournal() })
+        menuPanel.addView(menuItem("Exporter JSON") { exportPayloads() })
+        menuPanel.addView(menuItem("Exporter URL images") { exportImageResources() })
+        menuPanel.addView(menuItem("Exporter échantillon (5)") { exportSample() })
+
+        val floatingButton = TextView(this).apply {
+            text = "⋮"
+            textSize = 28f
+            gravity = Gravity.CENTER
+            setTextColor(Color.WHITE)
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Color.rgb(55, 105, 190))
+            }
+            elevation = dp(8).toFloat()
+            contentDescription = "Ouvrir le menu Grok Inspector"
+            setOnClickListener {
+                menuPanel.visibility =
+                    if (menuPanel.visibility == ViewGroup.VISIBLE) {
+                        ViewGroup.GONE
+                    } else {
+                        ViewGroup.VISIBLE
+                    }
+            }
+        }
+
+        val captureMenuButton = menuItem("Démarrer capture") {
+            captureEnabled = !captureEnabled
+            floatingButton.text = if (captureEnabled) "●" else "⋮"
+            floatingButton.background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(
+                    if (captureEnabled) Color.rgb(30, 145, 80)
+                    else Color.rgb(55, 105, 190)
+                )
+            }
+            Toast.makeText(
+                this,
+                if (captureEnabled) {
+                    "Capture des conversations activée"
+                } else {
+                    "Capture des conversations arrêtée"
+                },
+                Toast.LENGTH_SHORT
+            ).show()
+        }
+        menuPanel.addView(captureMenuButton)
+
+        root.addView(
+            menuPanel,
+            FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM or Gravity.END
+            ).apply {
+                setMargins(dp(12), dp(12), dp(12), dp(84))
+            }
+        )
+
+        root.addView(
+            floatingButton,
+            FrameLayout.LayoutParams(dp(56), dp(56), Gravity.BOTTOM or Gravity.END)
+                .apply {
+                    setMargins(dp(12), dp(12), dp(16), dp(16))
+                }
         )
 
         setContentView(root)
@@ -346,6 +456,9 @@ class MainActivity : Activity() {
             webView.restoreState(savedInstanceState)
         }
     }
+
+    private fun dp(value: Int): Int =
+        (value * resources.displayMetrics.density).toInt()
 
     private fun setupDetection() {
         if (!WebViewFeature.isFeatureSupported(
@@ -377,10 +490,13 @@ class MainActivity : Activity() {
                     if (sourceOrigin.host != "grok.com") return
 
                     message.data?.let {
-                        if (it.contains("\"type\":\"conversation_payload\"")) {
-                            recordPayload(it)
-                        } else {
-                            recordDetection(it)
+                        when {
+                            it.contains("\"type\":\"image_resource\"") ->
+                                recordImageResource(it)
+                            it.contains("\"type\":\"conversation_payload\"") ->
+                                recordPayload(it)
+                            else ->
+                                recordDetection(it)
                         }
                     }
                 }
@@ -442,6 +558,83 @@ class MainActivity : Activity() {
         } catch (_: Exception) {
             // Une donnée invalide ne doit pas interrompre le navigateur.
         }
+    }
+
+
+    private fun loadRecordedImageKeys() {
+        if (!imageResourcesFile.exists()) return
+        try {
+            imageResourcesFile.forEachLine { line ->
+                runCatching {
+                    val json = JSONObject(line)
+                    val url = json.optString("url")
+                    if (url.isNotBlank()) {
+                        val digest = MessageDigest.getInstance("SHA-256")
+                            .digest(url.toByteArray(Charsets.UTF_8))
+                        recordedImageKeys.add(
+                            digest.joinToString("") { "%02x".format(it) }
+                        )
+                    }
+                }
+            }
+        } catch (_: Exception) {
+            // Un fichier existant illisible ne doit pas bloquer le navigateur.
+        }
+    }
+
+    private fun recordImageResource(data: String) {
+        if (!captureEnabled) return
+        try {
+            if (data.toByteArray(Charsets.UTF_8).size > 10_000) return
+
+            val received = JSONObject(data)
+            if (received.optString("type") != "image_resource") return
+
+            val url = received.optString("url")
+            if (url.isBlank() || url.length > 4096) return
+
+            val parsed = Uri.parse(url)
+            if (parsed.scheme != "https" || parsed.host.isNullOrBlank()) return
+
+            val digest = MessageDigest.getInstance("SHA-256")
+                .digest(url.toByteArray(Charsets.UTF_8))
+            val key = digest.joinToString("") { "%02x".format(it) }
+
+            synchronized(recordedImageKeys) {
+                if (!recordedImageKeys.add(key)) return
+            }
+
+            val event = JSONObject()
+                .put("captured_at_epoch_ms", System.currentTimeMillis())
+                .put("url", url)
+                .put("initiator_type", received.optString("initiatorType"))
+
+            val directory = imageResourcesFile.parentFile
+            if (directory != null && !directory.exists()) {
+                directory.mkdirs()
+            }
+            imageResourcesFile.appendText(event.toString() + "\n")
+        } catch (_: Exception) {
+            // Une URL invalide ne doit pas interrompre le navigateur.
+        }
+    }
+
+    private fun exportImageResources() {
+        if (!imageResourcesFile.exists() || imageResourcesFile.length() == 0L) {
+            Toast.makeText(
+                this,
+                "Aucune URL d'image enregistrée",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/x-ndjson"
+            putExtra(Intent.EXTRA_TITLE, "grok_image_resources.jsonl")
+        }
+        startActivityForResult(intent, imageExportRequestCode)
     }
 
     private fun recordPayload(data: String) {
@@ -694,7 +887,8 @@ class MainActivity : Activity() {
 
         if (requestCode != exportRequestCode &&
             requestCode != payloadExportRequestCode &&
-            requestCode != sampleExportRequestCode) return
+            requestCode != sampleExportRequestCode &&
+            requestCode != imageExportRequestCode) return
 
         if (resultCode != RESULT_OK) {
             if (requestCode == sampleExportRequestCode) {
@@ -714,6 +908,7 @@ class MainActivity : Activity() {
         }
         val sourceFile = when (requestCode) {
             payloadExportRequestCode -> payloadFile
+            imageExportRequestCode -> imageResourcesFile
             sampleExportRequestCode -> pendingSampleFile ?: throw IllegalStateException("Échantillon temporaire introuvable")
             else -> journalFile
         }
@@ -732,6 +927,7 @@ class MainActivity : Activity() {
                 this,
                 when (requestCode) {
                     payloadExportRequestCode -> "Contenus JSON exportés avec succès"
+                    imageExportRequestCode -> "URL d'images exportées avec succès"
                     sampleExportRequestCode -> "Échantillon exporté avec succès"
                     else -> "Journal exporté avec succès"
                 },
