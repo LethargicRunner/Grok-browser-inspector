@@ -29,12 +29,14 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 import java.security.MessageDigest
+import java.util.UUID
 
 class MainActivity : Activity() {
 
     private lateinit var webView: WebView
     private var documentStartCapture = false
     private var captureEnabled = false
+    private var captureSessionId: String? = null
     private var pendingSampleFile: File? = null
     private var pendingFileChooserCallback:
         ValueCallback<Array<Uri>>? = null
@@ -409,6 +411,7 @@ class MainActivity : Activity() {
 
         val captureMenuButton = menuItem("Démarrer capture") {
             captureEnabled = !captureEnabled
+            captureSessionId = if (captureEnabled) UUID.randomUUID().toString() else null
             floatingButton.text = if (captureEnabled) "●" else "⋮"
             floatingButton.background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -582,6 +585,27 @@ class MainActivity : Activity() {
         }
     }
 
+    private fun classifyImageResource(parsed: Uri): String {
+        val host = parsed.host?.lowercase(Locale.ROOT) ?: return "unknown"
+        val path = parsed.path.orEmpty().lowercase(Locale.ROOT)
+        val query = parsed.query.orEmpty().lowercase(Locale.ROOT)
+        val indicators = "$path?$query"
+
+        if (listOf("pixel", "beacon", "tracking", "analytics", "collect", "1x1")
+                .any { it in indicators }) {
+            return "tracking_candidate"
+        }
+
+        val isGrokHost = host == "grok.com" || host.endsWith(".grok.com")
+        if (isGrokHost) {
+            return if (
+                host == "assets.grok.com" && path.contains("/generated/")
+            ) "grok_image" else "grok_resource"
+        }
+
+        return "third_party_image"
+    }
+
     private fun recordImageResource(data: String) {
         if (!captureEnabled) return
         try {
@@ -608,6 +632,13 @@ class MainActivity : Activity() {
                 .put("captured_at_epoch_ms", System.currentTimeMillis())
                 .put("url", url)
                 .put("initiator_type", received.optString("initiatorType"))
+                .put("resource_classification", classifyImageResource(parsed))
+                .put("app_version", BuildConfig.VERSION_NAME)
+                .put("version_code", BuildConfig.VERSION_CODE)
+                .put("git_commit", BuildConfig.GIT_COMMIT)
+                .put("build_type", BuildConfig.BUILD_TYPE)
+                .put("capture_session_id", captureSessionId ?: "unknown")
+                .put("schema_version", "1")
 
             val directory = imageResourcesFile.parentFile
             if (directory != null && !directory.exists()) {
