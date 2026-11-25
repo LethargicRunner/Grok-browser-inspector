@@ -33,6 +33,13 @@ import java.util.UUID
 
 class MainActivity : Activity() {
 
+    private companion object {
+        @Volatile
+        private var diagnosticExceptionHandlerInstalled = false
+
+        private val diagnosticLock = Any()
+    }
+
     private lateinit var webView: WebView
     private var documentStartCapture = false
     private var captureEnabled = false
@@ -57,6 +64,11 @@ class MainActivity : Activity() {
 
     private val imageResourcesFile: File
         get() = File(File(filesDir, "network-detection"), "image_resources.jsonl")
+
+    private val diagnosticFile: File
+        get() = File(File(filesDir, "network-detection"), "diagnostics.jsonl")
+
+    private val diagnosticExportRequestCode = 4107
 
     private val recordedImageKeys = HashSet<String>()
     private val sampleExportRequestCode = 4104
@@ -282,8 +294,76 @@ class MainActivity : Activity() {
         })();
     """.trimIndent()
 
+    private fun recordDiagnostic(event: String, details: JSONObject? = null) {
+        try {
+            val entry = JSONObject()
+                .put("timestamp_epoch_ms", System.currentTimeMillis())
+                .put("event", event)
+
+            if (details != null) {
+                entry.put("details", details)
+            }
+
+            diagnosticFile.parentFile?.mkdirs()
+
+            synchronized(diagnosticLock) {
+                diagnosticFile.appendText(
+                    entry.toString() + "\n",
+                    Charsets.UTF_8
+                )
+            }
+        } catch (_: Exception) {
+            // Le diagnostic ne doit jamais interrompre l'application.
+        }
+    }
+
+    private fun installDiagnosticExceptionHandler() {
+        synchronized(MainActivity::class.java) {
+            if (diagnosticExceptionHandlerInstalled) return
+
+            val targetFile = diagnosticFile
+            val previous = Thread.getDefaultUncaughtExceptionHandler()
+
+            Thread.setDefaultUncaughtExceptionHandler { thread, error ->
+                try {
+                    val stack = org.json.JSONArray()
+                    error.stackTrace.take(20).forEach {
+                        stack.put(it.toString().take(300))
+                    }
+
+                    val details = JSONObject()
+                        .put("thread", thread.name.take(80))
+                        .put("exception", error.javaClass.name)
+                        .put("message", error.message?.take(300) ?: "")
+                        .put("stack", stack)
+
+                    val entry = JSONObject()
+                        .put("timestamp_epoch_ms", System.currentTimeMillis())
+                        .put("event", "uncaught_exception")
+                        .put("details", details)
+
+                    targetFile.parentFile?.mkdirs()
+                    synchronized(diagnosticLock) {
+                        targetFile.appendText(
+                            entry.toString() + "\n",
+                            Charsets.UTF_8
+                        )
+                    }
+                } catch (_: Exception) {
+                    // Ne jamais bloquer le traitement du crash.
+                }
+
+                previous?.uncaughtException(thread, error)
+            }
+
+            diagnosticExceptionHandlerInstalled = true
+        }
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        installDiagnosticExceptionHandler()
+        recordDiagnostic("activity_created")
 
         webView = WebView(this)
 
@@ -304,15 +384,73 @@ class MainActivity : Activity() {
             override fun onPageFinished(view: WebView?, url: String?) {
                 super.onPageFinished(view, url)
 
+                recordDiagnostic("webview_page_finished")
+
                 if (!documentStartCapture &&
                     url?.startsWith("https://grok.com") == true
                 ) {
                     view?.evaluateJavascript(detectionScript, null)
                 }
             }
+
+            override fun onReceivedError(
+                view: WebView?,
+                request: android.webkit.WebResourceRequest?,
+                error: android.webkit.WebResourceError?
+            ) {
+                super.onReceivedError(view, request, error)
+
+                if (request?.isForMainFrame == true) {
+                    recordDiagnostic(
+                        "webview_main_frame_error",
+                        JSONObject()
+                            .put("error_code", error?.errorCode ?: -1)
+                            .put(
+                                "description",
+                                error?.description?.toString()?.take(300) ?: ""
+                            )
+                    )
+                }
+            }
+
+            override fun onRenderProcessGone(
+                view: WebView?,
+                detail: android.webkit.RenderProcessGoneDetail?
+            ): Boolean {
+                recordDiagnostic(
+                    "webview_render_process_gone",
+                    JSONObject().put("did_crash", detail?.didCrash() ?: false)
+                )
+
+                // Le moteur de rendu est perdu. Garder l'activité
+                // ouverte pour permettre l'export du diagnostic.
+                return true
+            }
         }
 
         webView.webChromeClient = object : WebChromeClient() {
+
+            override fun onConsoleMessage(
+                consoleMessage: android.webkit.ConsoleMessage?
+            ): Boolean {
+                if (consoleMessage != null) {
+                    val level = consoleMessage.messageLevel()
+
+                    if (
+                        level == android.webkit.ConsoleMessage.MessageLevel.WARNING ||
+                        level == android.webkit.ConsoleMessage.MessageLevel.ERROR
+                    ) {
+                        recordDiagnostic(
+                            "javascript_console",
+                            JSONObject()
+                                .put("level", level.toString())
+                                .put("line", consoleMessage.lineNumber())
+                        )
+                    }
+                }
+                return false
+            }
+
             override fun onShowFileChooser(
                 webView: WebView?,
                 filePathCallback: ValueCallback<Array<Uri>>?,
@@ -384,6 +522,7 @@ class MainActivity : Activity() {
 
         menuPanel.addView(menuItem("Diagnostic") { showDiagnostic() })
         menuPanel.addView(menuItem("Exporter le journal") { exportJournal() })
+        menuPanel.addView(menuItem("Exporter diagnostic") { exportDiagnostics() })
         menuPanel.addView(menuItem("Exporter JSON") { exportPayloads() })
         menuPanel.addView(menuItem("Exporter URL images") { exportImageResources() })
         menuPanel.addView(menuItem("Exporter échantillon (5)") { exportSample() })
@@ -871,6 +1010,25 @@ class MainActivity : Activity() {
         startActivityForResult(intent, exportRequestCode)
     }
 
+    private fun exportDiagnostics() {
+        if (!diagnosticFile.exists() || diagnosticFile.length() == 0L) {
+            Toast.makeText(
+                this,
+                "Aucun diagnostic à exporter",
+                Toast.LENGTH_SHORT
+            ).show()
+            return
+        }
+
+        val intent = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+            addCategory(Intent.CATEGORY_OPENABLE)
+            type = "application/x-ndjson"
+            putExtra(Intent.EXTRA_TITLE, "diagnostics.jsonl")
+        }
+
+        startActivityForResult(intent, diagnosticExportRequestCode)
+    }
+
     private fun exportPayloads() {
         if (!payloadFile.exists() || payloadFile.length() == 0L) {
             Toast.makeText(
@@ -919,7 +1077,8 @@ class MainActivity : Activity() {
         if (requestCode != exportRequestCode &&
             requestCode != payloadExportRequestCode &&
             requestCode != sampleExportRequestCode &&
-            requestCode != imageExportRequestCode) return
+            requestCode != imageExportRequestCode &&
+            requestCode != diagnosticExportRequestCode) return
 
         if (resultCode != RESULT_OK) {
             if (requestCode == sampleExportRequestCode) {
@@ -941,6 +1100,7 @@ class MainActivity : Activity() {
             payloadExportRequestCode -> payloadFile
             imageExportRequestCode -> imageResourcesFile
             sampleExportRequestCode -> pendingSampleFile ?: throw IllegalStateException("Échantillon temporaire introuvable")
+            diagnosticExportRequestCode -> diagnosticFile
             else -> journalFile
         }
 
@@ -960,6 +1120,7 @@ class MainActivity : Activity() {
                     payloadExportRequestCode -> "Contenus JSON exportés avec succès"
                     imageExportRequestCode -> "URL d'images exportées avec succès"
                     sampleExportRequestCode -> "Échantillon exporté avec succès"
+                    diagnosticExportRequestCode -> "Diagnostics exportés avec succès"
                     else -> "Journal exporté avec succès"
                 },
                 Toast.LENGTH_LONG
@@ -993,7 +1154,23 @@ class MainActivity : Activity() {
         super.onSaveInstanceState(outState)
     }
 
+    override fun onTrimMemory(level: Int) {
+        super.onTrimMemory(level)
+
+        recordDiagnostic(
+            "memory_trim",
+            JSONObject().put("level", level)
+        )
+    }
+
+    override fun onLowMemory() {
+        super.onLowMemory()
+        recordDiagnostic("low_memory")
+    }
+
     override fun onDestroy() {
+        recordDiagnostic("activity_destroyed")
+
         if (::webView.isInitialized) {
             webView.destroy()
         }
